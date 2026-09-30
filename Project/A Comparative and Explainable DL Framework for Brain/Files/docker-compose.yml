@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  brain-tumor-app:
+    image: brain-tumor-ai:latest
+    container_name: brain-tumor-segmentation
+    ports:
+      - "5000:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PORT=5000
+    volumes:
+      # Mount datasets as read-only so the app can access the demo samples
+      # These are excluded from the Docker build context by .dockerignore to keep the image size small
+      - ./DATASET:/app/DATASET:ro
+      - ./Datasets:/app/Datasets:ro
+      - ./Frontend:/app/Frontend
+    restart: unless-stopped

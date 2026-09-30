@@ -1,0 +1,1043 @@
+# ==========================================
+# 3. CUSTOM DATASET & DATALOADER PIPELINE
+# ==========================================
+class BrainTumorSegmentationDataset(Dataset):
+    def __init__(self, file_pairs, image_size=(224, 224), is_train=True):
+        """
+        file_pairs: list of tuples (img_path, mask_path, category)
+        """
+        self.file_pairs = file_pairs
+        self.image_size = image_size
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        img_path, mask_path, _ = self.file_pairs[idx]
+
+        # Load RGB scan and Grayscale mask
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+
+        # Resize both to exact model input size
+        image = TF.resize(image, self.image_size)
+        mask = TF.resize(mask, self.image_size, interpolation=TF.InterpolationMode.NEAREST)
+
+        # Joint Data Augmentations for Training
+        if self.is_train:
+            # 50% Random Horizontal Flip
+            if random.random() > 0.5:
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
+
+            # 50% Random Vertical Flip
+            if random.random() > 0.5:
+                image = TF.vflip(image)
+                mask = TF.vflip(mask)
+
+            # Random slight rotation (-10 to +10 degrees)
+            if random.random() > 0.5:
+                angle = random.uniform(-10, 10)
+                image = TF.rotate(image, angle)
+                mask = TF.rotate(mask, angle, interpolation=TF.InterpolationMode.NEAREST)
+
+        # Convert to PyTorch tensors
+        image = TF.to_tensor(image)  # [3, 224, 224] in range [0.0, 1.0]
+        mask = TF.to_tensor(mask)    # [1, 224, 224] in range [0.0, 1.0]
+
+        # Strict binarization of tumor mask
+        mask = (mask > 0.5).float()
+
+        # ImageNet normalization for MRI
+        image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        return image, mask
+
+# 80/20 Train-Validation Split
+random.seed(42)
+shuffled_pairs = all_file_pairs.copy()
+random.shuffle(shuffled_pairs)
+
+train_split_idx = int(0.8 * len(shuffled_pairs))
+train_pairs = shuffled_pairs[:train_split_idx]
+val_pairs = shuffled_pairs[train_split_idx:]
+
+# Instantiate Datasets
+IMAGE_SIZE = (224, 224)
+train_dataset = BrainTumorSegmentationDataset(train_pairs, image_size=IMAGE_SIZE, is_train=True)
+val_dataset = BrainTumorSegmentationDataset(val_pairs, image_size=IMAGE_SIZE, is_train=False)
+
+# Instantiate DataLoaders
+BATCH_SIZE = 16  # Adjust based on GPU VRAM (16 or 32)
+NUM_WORKERS = 0   # Set to 0 on Windows to avoid multiprocessing issues in notebooks
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"[BATCH] Training Batches: {len(train_loader)} ({len(train_dataset)} samples)")
+print(f"[BATCH] Validation Batches: {len(val_loader)} ({len(val_dataset)} samples)")
+
+# Inspect batch shapes
+sample_images, sample_masks = next(iter(train_loader))
+print(f"\nBatch Image Tensor: {sample_images.shape} (dtype: {sample_images.dtype})")
+print(f"Batch Mask Tensor:  {sample_masks.shape} (dtype: {sample_masks.dtype})")
+
+---
+# ==========================================
+# 7. TRAINING & VALIDATION FUNCTIONS
+# ==========================================
+def calculate_accuracy(logits, targets, threshold=0.5):
+    """Calculates exact pixel-wise accuracy for the batch"""
+    preds = (torch.sigmoid(logits) > threshold).float()
+    correct = (preds == targets).float().sum().item()
+    total = targets.numel()
+    return (correct / total) * 100.0
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+    running_dice = 0.0
+    running_iou = 0.0
+    running_acc = 0.0
+
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for images, masks in pbar:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, masks)
+        loss.backward()
+
+        # Gradient clipping to prevent transformer gradient explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        # Metrics calculation
+        dice, iou = calculate_metrics(logits, masks)
+        acc = calculate_accuracy(logits, masks)
+
+        running_loss += loss.item() * images.size(0)
+        running_dice += dice * images.size(0)
+        running_iou += iou * images.size(0)
+        running_acc += acc * images.size(0)
+
+        pbar.set_postfix({'Loss': f'{loss.item():.4f}', 'Dice': f'{dice:.4f}', 'Acc': f'{acc:.2f}%'})
+
+    dataset_size = len(dataloader.dataset)
+    epoch_loss = running_loss / dataset_size
+    epoch_dice = running_dice / dataset_size
+    epoch_iou = running_iou / dataset_size
+    epoch_acc = running_acc / dataset_size
+
+    return epoch_loss, epoch_dice, epoch_iou, epoch_acc
+
+
+@torch.no_grad()
+def validate_epoch(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    running_dice = 0.0
+    running_iou = 0.0
+    running_acc = 0.0
+
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        logits = model(images)
+        loss = criterion(logits, masks)
+
+        dice, iou = calculate_metrics(logits, masks)
+        acc = calculate_accuracy(logits, masks)
+
+        running_loss += loss.item() * images.size(0)
+        running_dice += dice * images.size(0)
+        running_iou += iou * images.size(0)
+        running_acc += acc * images.size(0)
+
+    dataset_size = len(dataloader.dataset)
+    val_loss = running_loss / dataset_size
+    val_dice = running_dice / dataset_size
+    val_iou = running_iou / dataset_size
+    val_acc = running_acc / dataset_size
+
+    return val_loss, val_dice, val_iou, val_acc
+
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=15, save_path="best_hybrid_transunet.pth"):
+    history = {
+        'train_loss': [], 'val_loss': [], 
+        'train_dice': [], 'val_dice': [], 
+        'train_iou': [],  'val_iou': [],
+        'train_acc': [],  'val_acc': []
+    }
+    best_val_dice = 0.0
+
+    print(f"[INFO] Starting Training for {num_epochs} Epochs on {device}...")
+    print("=" * 80)
+
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_dice, train_iou, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_dice, val_iou, val_acc = validate_epoch(model, val_loader, criterion, device)
+
+        # Robust scheduler step (works for both CosineAnnealingLR and ReduceLROnPlateau)
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        elif scheduler is not None:
+            scheduler.step()
+
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Append to history
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_dice'].append(train_dice)
+        history['val_dice'].append(val_dice)
+        history['train_iou'].append(train_iou)
+        history['val_iou'].append(val_iou)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+
+        print(f"Epoch [{epoch:02d}/{num_epochs:02d}] | LR: {current_lr:.6f} | "
+              f"Loss: {train_loss:.4f}/{val_loss:.4f} | "
+              f"Dice: {train_dice:.4f}/{val_dice:.4f} | "
+              f"Val Acc: {val_acc:.2f}%")
+
+        # Save best model checkpoint
+        if val_dice > best_val_dice:
+            best_val_dice = val_dice
+            torch.save(model.state_dict(), save_path)
+            
+            # Also sync with frontend weights directory if it exists
+            frontend_path = "../Frontend/best_hybrid_transunet.pth"
+            if os.path.exists("../Frontend"):
+                torch.save(model.state_dict(), frontend_path)
+
+            print(f"  [BEST] Model Saved! (Val Dice: {best_val_dice:.4f} | Val Acc: {val_acc:.2f}%)")
+
+    print("=" * 80)
+    print(f"[DONE] Training Complete! Peak Validation Dice Score: {best_val_dice:.4f}")
+    return history
+
+---
+# Run the training process and save the results into the 'history' variable
+history = train_model(
+    model=model, 
+    train_loader=train_loader, 
+    val_loader=val_loader, 
+    criterion=criterion, 
+    optimizer=optimizer, 
+    scheduler=scheduler, 
+    num_epochs=15
+)
+
+---
+plt.plot(history['train_acc'], label='Train Accuracy')
+plt.plot(history['val_acc'], label='Validation Accuracy')
+plt.legend()
+plt.show()
+---
+%pip install lion-pytorch
+
+# ==========================================
+# 8. EXECUTE TRAINING WITH LION
+# ==========================================
+# Increased from 15 to 50 to allow the Transformer to converge
+NUM_EPOCHS = 50 
+LEARNING_RATE = 1e-4  
+
+from lion_pytorch import Lion # Ensure Lion is imported if you are using it
+
+optimizer = Lion(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+# Run training
+history = train_model(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion=criterion,      # Now using FocalTverskyLoss
+    optimizer=optimizer,
+    scheduler=scheduler,
+    num_epochs=NUM_EPOCHS,
+    save_path="best_hybrid_transunet.pth"
+)
+
+---
+# ==========================================
+# 9. PLOT TRAINING & VALIDATION CURVES
+# ==========================================
+epochs_range = range(1, len(history['train_loss']) + 1)
+
+plt.figure(figsize=(16, 5))
+
+# 1. Loss Curve
+plt.subplot(1, 3, 1)
+plt.plot(epochs_range, history['train_loss'], 'o-', label='Train Loss', color='#2C3E50', linewidth=2)
+plt.plot(epochs_range, history['val_loss'], 's--', label='Validation Loss', color='#FF5733', linewidth=2)
+plt.title('Loss Progression (BCE + Dice)', fontsize=13, fontweight='bold')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.6)
+
+# 2. Dice Score Curve
+plt.subplot(1, 3, 2)
+plt.plot(epochs_range, history['train_dice'], 'o-', label='Train Dice', color='#27AE60', linewidth=2)
+plt.plot(epochs_range, history['val_dice'], 's--', label='Validation Dice', color='#E67E22', linewidth=2)
+plt.title('Dice Similarity Coefficient (F1)', fontsize=13, fontweight='bold')
+plt.xlabel('Epoch')
+plt.ylabel('Dice Score')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.6)
+
+# 3. IoU Curve
+plt.subplot(1, 3, 3)
+plt.plot(epochs_range, history['train_iou'], 'o-', label='Train IoU', color='#2980B9', linewidth=2)
+plt.plot(epochs_range, history['val_iou'], 's--', label='Validation IoU', color='#8E44AD', linewidth=2)
+plt.title('Intersection over Union (IoU)', fontsize=13, fontweight='bold')
+plt.xlabel('Epoch')
+plt.ylabel('IoU')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.6)
+
+plt.tight_layout()
+plt.show()
+
+---
+# ==========================================
+# 10. VISUALIZE MODEL PREDICTIONS ON TEST SET
+# ==========================================
+@torch.no_grad()
+def visualize_test_predictions(model, dataloader, device, num_samples=6, threshold=0.5):
+    # Load best saved weights
+    if os.path.exists("best_hybrid_transunet.pth"):
+        model.load_state_dict(torch.load("best_hybrid_transunet.pth", map_location=device))
+        print("[OK] Loaded best model weights from 'best_hybrid_transunet.pth'")
+    
+    model.eval()
+    
+    images_list, masks_list, preds_list, dices_list = [], [], [], []
+    
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+        logits = model(images)
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
+        
+        for i in range(images.size(0)):
+            dice, _ = calculate_metrics(logits[i:i+1], masks[i:i+1], threshold=threshold)
+            images_list.append(images[i].cpu())
+            masks_list.append(masks[i].cpu())
+            preds_list.append(preds[i].cpu())
+            dices_list.append(dice)
+            
+            if len(images_list) >= num_samples:
+                break
+        if len(images_list) >= num_samples:
+            break
+
+    plt.figure(figsize=(16, num_samples * 3.5))
+    
+    for idx in range(num_samples):
+        img_np = denormalize_image(images_list[idx])
+        gt_np = masks_list[idx].squeeze().numpy()
+        pred_np = preds_list[idx].squeeze().numpy()
+        dice_score = dices_list[idx]
+        
+        # 1. Original MRI
+        plt.subplot(num_samples, 4, idx * 4 + 1)
+        plt.imshow(img_np)
+        plt.title(f"Test Scan #{idx+1}")
+        plt.axis('off')
+        
+        # 2. Ground Truth Mask
+        plt.subplot(num_samples, 4, idx * 4 + 2)
+        plt.imshow(gt_np, cmap='gray')
+        plt.title("Ground Truth Mask")
+        plt.axis('off')
+        
+        # 3. Model Predicted Mask
+        plt.subplot(num_samples, 4, idx * 4 + 3)
+        plt.imshow(pred_np, cmap='gray')
+        plt.title(f"Predicted Mask (Dice: {dice_score:.3f})")
+        plt.axis('off')
+        
+        # 4. Color-Coded Overlay
+        # Red = Ground Truth, Blue = Predicted, Magenta/Purple = Overlap
+        overlay = np.zeros((*gt_np.shape, 3), dtype=np.float32)
+        overlay[..., 0] = gt_np   # Red
+        overlay[..., 2] = pred_np # Blue
+        
+        plt.subplot(num_samples, 4, idx * 4 + 4)
+        plt.imshow(img_np)
+        plt.imshow(overlay, alpha=0.5)
+        plt.title("Overlay (Red: GT, Blue: Pred)")
+        plt.axis('off')
+
+    plt.suptitle("Clinical Tumor Segmentation Inference (Hybrid CNN-Transformer U-Net)", fontsize=16, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    plt.show()
+
+# Run qualitative test evaluation
+visualize_test_predictions(model, val_loader, device, num_samples=6)
+
+---
+#11. Comprehensive Accuracy Evaluation Function
+#This calculates the exact Pixel Accuracy, Dice Similarity Coefficient (F1), IoU (Jaccard Index), Sensitivity (Recall), and Specificity over your validation or test dataset:
+
+#python
+# =====================================================================
+# ACCURACY & CLINICAL SEGMENTATION METRICS EVALUATION
+# =====================================================================
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+@torch.no_grad()
+def evaluate_model_accuracy(model, dataloader, device, threshold=0.5):
+    """
+    Computes comprehensive accuracy and overlap metrics on a dataloader.
+    """
+    model.eval()
+    
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_tn = 0
+    dice_scores = []
+    iou_scores = []
+    pixel_accuracies = []
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+        
+        logits = model(images)
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
+        
+        preds_np = preds.cpu().numpy().astype(np.uint8)
+        masks_np = masks.cpu().numpy().astype(np.uint8)
+        
+        for p, t in zip(preds_np, masks_np):
+            p_flat = p.flatten()
+            t_flat = t.flatten()
+            
+            tp = np.sum((p_flat == 1) & (t_flat == 1))
+            fp = np.sum((p_flat == 1) & (t_flat == 0))
+            fn = np.sum((p_flat == 0) & (t_flat == 1))
+            tn = np.sum((p_flat == 0) & (t_flat == 0))
+            
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_tn += tn
+            
+            # Per-scan metrics
+            pixel_acc = (tp + tn) / (tp + tn + fp + fn + 1e-7)
+            dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-7)
+            iou = tp / (tp + fp + fn + 1e-7)
+            
+            pixel_accuracies.append(pixel_acc)
+            dice_scores.append(dice)
+            iou_scores.append(iou)
+    # Global Dataset-Level Metrics
+    global_pixel_acc = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn)
+    global_dice = (2.0 * total_tp) / (2.0 * total_tp + total_fp + total_fn + 1e-7)
+    global_iou = total_tp / (total_tp + total_fp + total_fn + 1e-7)
+    sensitivity = total_tp / (total_tp + total_fn + 1e-7)  # Recall
+    specificity = total_tn / (total_tn + total_fp + 1e-7)
+    precision = total_tp / (total_tp + total_fp + 1e-7)
+    
+    results = {
+        "Metric": [
+            "Pixel Accuracy",
+            "Dice Similarity Coefficient (DSC / F1)",
+            "Intersection over Union (IoU / Jaccard)",
+            "Sensitivity / Recall (Tumor Detection)",
+            "Specificity (Healthy Tissue Protection)",
+            "Precision"
+        ],
+        "Score (%)": [
+            f"{global_pixel_acc * 100:.2f}%",
+            f"{global_dice * 100:.2f}%",
+            f"{global_iou * 100:.2f}%",
+            f"{sensitivity * 100:.2f}%",
+            f"{specificity * 100:.2f}%",
+            f"{precision * 100:.2f}%"
+        ],
+        "Mean ± Std (Per Scan)": [
+            f"{np.mean(pixel_accuracies)*100:.2f}% ± {np.std(pixel_accuracies)*100:.2f}%",
+            f"{np.mean(dice_scores)*100:.2f}% ± {np.std(dice_scores)*100:.2f}%",
+            f"{np.mean(iou_scores)*100:.2f}% ± {np.std(iou_scores)*100:.2f}%",
+            "-",
+            "-",
+            "-"
+        ]
+    }
+    
+    df_metrics = pd.DataFrame(results)
+    
+    print("\n" + "=" * 65)
+    print(" 🩺 HYBRID CNN-TRANSFORMER U-NET ACCURACY REPORT")
+    print("=" * 65)
+    print(df_metrics.to_string(index=False))
+    print("=" * 65 + "\n")
+    
+    return df_metrics, (total_tp, total_fp, total_fn, total_tn)
+#2. Plotting Confusion Matrix (Pixel-Level Classification)
+#Visualizes False Positives, False Negatives, True Positives, and True Negatives:
+
+#python
+def plot_pixel_confusion_matrix(tp, fp, fn, tn):
+    cm = np.array([[tn, fp], 
+                   [fn, tp]])
+    cm_norm = cm.astype('float') / cm.sum()
+    
+    labels = [f"TN\n{tn:,}\n({cm_norm[0,0]*100:.1f}%)",
+              f"FP\n{fp:,}\n({cm_norm[0,1]*100:.1f}%)",
+              f"FN\n{fn:,}\n({cm_norm[1,0]*100:.1f}%)",
+              f"TP\n{tp:,}\n({cm_norm[1,1]*100:.1f}%)"]
+    labels = np.asarray(labels).reshape(2, 2)
+    
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_norm, annot=labels, fmt="", cmap="Blues", cbar=True,
+                xticklabels=["Background", "Tumor"],
+                yticklabels=["Background", "Tumor"],
+                annot_kws={"size": 11, "weight": "bold"})
+    
+    plt.title("Pixel-Level Segmentation Confusion Matrix", fontsize=13, fontweight='bold', pad=12)
+    plt.xlabel("Predicted Label", fontsize=11)
+    plt.ylabel("Ground Truth", fontsize=11)
+    plt.tight_layout()
+    plt.show()
+#3. Displaying Accuracy Curves Across Epochs (Dashboard)
+#If you have trained your model and have a history dictionary (as defined in brain_tumor_segmentation_hybrid_transunet.ipynb), this plots a 4-panel performance dashboard:
+
+#python
+def plot_training_accuracy_dashboard(history):
+    """
+    Plots Loss, Dice Accuracy, and IoU Progression across training epochs.
+    """
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    sns.set_theme(style="whitegrid")
+    
+    # 1. Dice Score (Accuracy Metric for Segmentation)
+    axes[0].plot(epochs, [d * 100 for d in history['train_dice']], 'o-', label='Train Dice Acc (%)', color='#2ECC71', lw=2.5)
+    axes[0].plot(epochs, [d * 100 for d in history['val_dice']], 's--', label='Val Dice Acc (%)', color='#E67E22', lw=2.5)
+    axes[0].set_title("Dice Similarity Accuracy", fontsize=13, fontweight='bold')
+    axes[0].set_xlabel("Epochs", fontsize=11)
+    axes[0].set_ylabel("Accuracy (%)", fontsize=11)
+    axes[0].legend(loc="lower right")
+    axes[0].set_ylim([0, 105])
+    
+    # 2. IoU (Jaccard) Metric
+    axes[1].plot(epochs, [i * 100 for i in history['train_iou']], 'o-', label='Train IoU (%)', color='#3498DB', lw=2.5)
+    axes[1].plot(epochs, [i * 100 for i in history['val_iou']], 's--', label='Val IoU (%)', color='#9B59B6', lw=2.5)
+    axes[1].set_title("Intersection over Union (IoU)", fontsize=13, fontweight='bold')
+    axes[1].set_xlabel("Epochs", fontsize=11)
+    axes[1].set_ylabel("IoU (%)", fontsize=11)
+    axes[1].legend(loc="lower right")
+    axes[1].set_ylim([0, 105])
+    # 3. Combined BCE + Dice Loss
+    axes[2].plot(epochs, history['train_loss'], 'o-', label='Train Loss', color='#34495E', lw=2.5)
+    axes[2].plot(epochs, history['val_loss'], 's--', label='Val Loss', color='#E74C3C', lw=2.5)
+    axes[2].set_title("Loss Convergence (Dice + BCE)", fontsize=13, fontweight='bold')
+    axes[2].set_xlabel("Epochs", fontsize=11)
+    axes[2].set_ylabel("Loss", fontsize=11)
+    axes[2].legend(loc="upper right")
+    plt.suptitle("TransUNet Clinical Tumor Segmentation Training Progression", fontsize=15, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
+#4. Running Everything
+#In your notebook or script, simply call:
+
+#python
+# 1. Run accuracy evaluation on the validation set
+df_metrics, (tp, fp, fn, tn) = evaluate_model_accuracy(model, val_loader, device)
+# 2. Display the Confusion Matrix
+plot_pixel_confusion_matrix(tp, fp, fn, tn)
+# 3. Plot training curves (if history is available from train_model())
+if 'history' in locals():
+    plot_training_accuracy_dashboard(history)
+
+
+
+---
+import torch
+
+# 1. Load the best trained weights
+checkpoint_path = "best_hybrid_transunet.pth"
+model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+model.eval()
+
+# 2. Compute exact pixel accuracy and Dice score across the validation set
+correct_pixels = 0
+total_pixels = 0
+total_intersection = 0
+total_union_dice = 0
+
+with torch.no_grad():
+    for images, masks in val_loader:
+        images = images.to(device)
+        masks = masks.to(device)
+        
+        # Binary prediction with standard 0.5 threshold
+        probs = torch.sigmoid(model(images))
+        preds = (probs > 0.5).float()
+        
+        # Pixel Accuracy: (TP + TN) / Total Pixels
+        correct_pixels += (preds == masks).sum().item()
+        total_pixels += masks.numel()
+        
+        # Dice Accuracy: 2*TP / (Pred + Target)
+        total_intersection += (preds * masks).sum().item()
+        total_union_dice += (preds.sum().item() + masks.sum().item())
+
+pixel_accuracy = (correct_pixels / total_pixels) * 100
+dice_accuracy = (2.0 * total_intersection / (total_union_dice + 1e-6)) * 100
+
+# 3. Print the exact numbers
+print("=" * 45)
+print(f"  EXACT PIXEL ACCURACY : {pixel_accuracy:.2f}%")
+print(f"  DICE SCORE (OVERLAP) : {dice_accuracy:.2f}%")
+print("=" * 45)
+
+---
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+# ==========================================================
+# 10. COMPREHENSIVE CLINICAL EVALUATION & CORRELATION MATRIX
+# ==========================================================
+
+def compute_detailed_metrics(model, val_loader, threshold=0.5, device='cuda'):
+    """
+    Evaluates the model over the validation set and collects:
+    - Aggregate pixel confusion matrix (TP, FP, TN, FN)
+    - Global clinical segmentation metrics
+    - Per-slice metric records for correlation analysis
+    """
+    model.eval()
+    
+    total_tp = 0
+    total_fp = 0
+    total_tn = 0
+    total_fn = 0
+    
+    slice_records = []
+    
+    with torch.no_grad():
+        for batch_idx, (images, masks) in enumerate(val_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            # Predict probabilities
+            probs = torch.sigmoid(model(images))
+            preds = (probs > threshold).float()
+            
+            # Iterate through each slice in batch
+            for i in range(images.size(0)):
+                pred_flat = preds[i].view(-1).cpu().numpy()
+                mask_flat = masks[i].view(-1).cpu().numpy()
+                
+                tp = np.sum((pred_flat == 1) & (mask_flat == 1))
+                fp = np.sum((pred_flat == 1) & (mask_flat == 0))
+                tn = np.sum((pred_flat == 0) & (mask_flat == 0))
+                fn = np.sum((pred_flat == 0) & (mask_flat == 1))
+                
+                total_tp += tp
+                total_fp += fp
+                total_tn += tn
+                total_fn += fn
+                
+                # Per-slice metrics
+                tumor_size = int(np.sum(mask_flat))
+                dice = (2.0 * tp + 1e-6) / (2.0 * tp + fp + fn + 1e-6)
+                iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
+                precision = (tp + 1e-6) / (tp + fp + 1e-6)
+                recall = (tp + 1e-6) / (tp + fn + 1e-6)
+                specificity = (tn + 1e-6) / (tn + fp + 1e-6)
+                accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-6)
+                
+                # Only analyze slices containing tumor for meaningful correlation
+                if tumor_size > 0:
+                    slice_records.append({
+                        'Tumor_Size_Pixels': tumor_size,
+                        'Dice_Score': dice,
+                        'IoU_Jaccard': iou,
+                        'Precision': precision,
+                        'Recall_Sensitivity': recall,
+                        'Specificity': specificity,
+                        'Pixel_Accuracy': accuracy
+                    })
+                    
+    # Calculate Global Summary Metrics
+    global_dice = (2.0 * total_tp) / (2.0 * total_tp + total_fp + total_fn + 1e-6)
+    global_iou = total_tp / (total_tp + total_fp + total_fn + 1e-6)
+    global_acc = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn + 1e-6)
+    global_sens = total_tp / (total_tp + total_fn + 1e-6)       # Recall
+    global_spec = total_tn / (total_tn + total_fp + 1e-6)       # Specificity
+    global_prec = total_tp / (total_tp + total_fp + 1e-6)       # Precision
+    global_f2 = (5.0 * total_tp) / (5.0 * total_tp + 4.0 * total_fn + total_fp + 1e-6)
+    
+    summary = {
+        'Dice Similarity Coefficient (DSC)': global_dice,
+        'Intersection over Union (IoU)': global_iou,
+        'Pixel Accuracy': global_acc,
+        'Sensitivity / Recall (TPR)': global_sens,
+        'Specificity (TNR)': global_spec,
+        'Precision (PPV)': global_prec,
+        'F2-Score': global_f2,
+        'True Positives (TP)': total_tp,
+        'False Positives (FP)': total_fp,
+        'True Negatives (TN)': total_tn,
+        'False Negatives (FN)': total_fn
+    }
+    
+    df_slices = pd.DataFrame(slice_records)
+    cm_matrix = np.array([[total_tn, total_fp], [total_fn, total_tp]])
+    
+    return summary, cm_matrix, df_slices
+
+
+# ==========================================================
+# RUN EVALUATION & PLOT
+# ==========================================================
+# Use optimal threshold from BWO if available, otherwise default to 0.5
+eval_threshold = optimal_threshold[0] if 'optimal_threshold' in globals() else 0.5
+
+print(f"--> Running Clinical Evaluation at Threshold: {eval_threshold:.3f}")
+summary, cm, df_slices = compute_detailed_metrics(
+    model=model, 
+    val_loader=val_loader, 
+    threshold=eval_threshold, 
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+)
+
+# 1. Print Formatted Metrics Summary
+print("\n" + "="*50)
+print("       CLINICAL SEGMENTATION PERFORMANCE REPORT")
+print("="*50)
+for k, v in summary.items():
+    if isinstance(v, float):
+        print(f" {k:<35}: {v*100:.2f}%" if 'Score' in k or 'Coefficient' in k or 'Accuracy' in k or 'IoU' in k or 'Sensitivity' in k or 'Specificity' in k or 'Precision' in k else f" {k:<35}: {v:.4f}")
+    else:
+        print(f" {k:<35}: {v:,} pixels")
+print("="*50)
+
+# 2. Visualizations: Confusion Matrix & Correlation Matrix
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Subplot A: Pixel-Level Confusion Matrix (Normalized)
+cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+sns.heatmap(
+    cm_normalized, 
+    annot=True, 
+    fmt='.2%', 
+    cmap='Blues', 
+    cbar=True,
+    xticklabels=['Predicted Healthy', 'Predicted Tumor'],
+    yticklabels=['Actual Healthy', 'Actual Tumor'],
+    ax=axes[0],
+    annot_kws={"size": 13, "weight": "bold"}
+)
+axes[0].set_title(f'Normalized Confusion Matrix (Threshold = {eval_threshold:.2f})', fontsize=14, pad=12)
+axes[0].set_ylabel('Ground Truth', fontsize=12)
+axes[0].set_xlabel('Model Prediction', fontsize=12)
+
+# Subplot B: Correlation Matrix Across Evaluation Parameters
+corr = df_slices.corr(method='pearson')
+sns.heatmap(
+    corr, 
+    annot=True, 
+    fmt='.2f', 
+    cmap='coolwarm', 
+    vmin=-1.0, 
+    vmax=1.0, 
+    linewidths=0.8,
+    cbar=True,
+    ax=axes[1],
+    annot_kws={"size": 10}
+)
+axes[1].set_title('Evaluation Parameters Correlation Matrix', fontsize=14, pad=12)
+plt.xticks(rotation=45, ha='right')
+
+plt.tight_layout()
+plt.show()
+
+---
+import time
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ==========================================================
+# 1. DEFINE VANILLA CNN / YOLOv4-CSP BASELINE MODEL
+# ==========================================================
+class CSPBlock(nn.Module):
+    """YOLOv4 Cross-Stage Partial (CSP) Darknet style convolutional block"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        mid_ch = out_ch // 2
+        self.conv_part1 = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, 1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.LeakyReLU(0.1, inplace=True)
+        )
+        self.conv_part2 = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, 1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.LeakyReLU(0.1, inplace=True)
+        )
+        self.conv_out = nn.Sequential(
+            nn.Conv2d(mid_ch * 2, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.1, inplace=True)
+        )
+
+    def forward(self, x):
+        p1 = self.conv_part1(x)
+        p2 = self.conv_part2(x)
+        return self.conv_out(torch.cat([p1, p2], dim=1))
+
+
+class VanillaCNN_UNet(nn.Module):
+    """
+    Standard Pure-Convolutional Baseline (No Vision Transformer).
+    Uses the exact same encoder/decoder channel hierarchy as Hybrid TransUNet
+    with a pure Conv/CSP bottleneck instead of Self-Attention.
+    """
+    def __init__(self, in_channels=3, num_classes=1, use_csp=True):
+        super().__init__()
+        bottleneck_block = CSPBlock if use_csp else ConvBlock
+
+        # Encoder
+        self.enc1 = ConvBlock(in_channels, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = ConvBlock(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = ConvBlock(128, 128)
+
+        # Pure Convolutional / YOLOv4-CSP Bottleneck (No ViT)
+        self.bottleneck = bottleneck_block(128, 128)
+
+        # Decoder
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(64 + 64, 64)
+        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(32 + 64, 32)
+        self.out_conv = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+        e3 = self.enc3(p2)
+        
+        b = self.bottleneck(e3)
+
+        d1 = self.up1(b)
+        d1 = torch.cat([d1, p1], dim=1)
+        d1 = self.dec1(d1)
+
+        d2 = self.up2(d1)
+        d2 = torch.cat([d2, e1], dim=1)
+        d2 = self.dec2(d2)
+
+        return self.out_conv(d2)
+
+
+# ==========================================================
+# 2. BENCHMARKING ENGINE
+# ==========================================================
+def evaluate_model_pipeline(eval_model, data_loader, threshold=0.5, device='cuda'):
+    """Evaluates metrics and measures inference latency."""
+    eval_model.eval()
+    total_tp = total_fp = total_tn = total_fn = 0
+    inference_times = []
+
+    with torch.no_grad():
+        for images, masks in data_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Measure inference latency
+            start_time = time.perf_counter()
+            outputs = eval_model(images)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            inference_times.append((time.perf_counter() - start_time) / images.size(0))
+
+            preds = (torch.sigmoid(outputs) > threshold).float()
+
+            pred_flat = preds.view(-1)
+            mask_flat = masks.view(-1)
+
+            total_tp += (pred_flat * mask_flat).sum().item()
+            total_fp += (pred_flat * (1.0 - mask_flat)).sum().item()
+            total_tn += ((1.0 - pred_flat) * (1.0 - mask_flat)).sum().item()
+            total_fn += ((1.0 - pred_flat) * mask_flat).sum().item()
+
+    # Metric calculations
+    eps = 1e-6
+    dice = (2.0 * total_tp) / (2.0 * total_tp + total_fp + total_fn + eps)
+    iou = total_tp / (total_tp + total_fp + total_fn + eps)
+    acc = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn + eps)
+    sens = total_tp / (total_tp + total_fn + eps)  # Recall
+    spec = total_tn / (total_tn + total_fp + eps)  # Specificity
+    prec = total_tp / (total_tp + total_fp + eps)  # Precision
+    avg_latency_ms = np.mean(inference_times) * 1000
+    fps = 1.0 / np.mean(inference_times)
+
+    return {
+        'Pixel Accuracy': acc,
+        'Dice (F1-Score)': dice,
+        'IoU (Jaccard)': iou,
+        'Sensitivity (Recall)': sens,
+        'Specificity': spec,
+        'Precision': prec,
+        'Latency (ms/slice)': avg_latency_ms,
+        'Inference FPS': fps
+    }
+
+
+# ==========================================================
+# 3. RUN COMPARISON
+# ==========================================================
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# 1. Initialize Vanilla Baseline
+vanilla_model = VanillaCNN_UNet(in_channels=3, num_classes=1, use_csp=True).to(device)
+
+# Optional: If you have pre-saved weights for Vanilla CNN, load them:
+# vanilla_model.load_state_dict(torch.load("best_vanilla_cnn.pth", map_location=device))
+
+# 2. Evaluate both models
+print("--> Evaluating Hybrid TransUNet...")
+hybrid_metrics = evaluate_model_pipeline(model, val_loader, threshold=0.5, device=device)
+
+print("--> Evaluating Vanilla CNN / YOLOv4 Baseline...")
+vanilla_metrics = evaluate_model_pipeline(vanilla_model, val_loader, threshold=0.5, device=device)
+
+# 3. Build Comparison Table
+comparison_rows = []
+for metric in ['Pixel Accuracy', 'Dice (F1-Score)', 'IoU (Jaccard)', 'Sensitivity (Recall)', 'Specificity', 'Precision']:
+    v_val = vanilla_metrics[metric] * 100
+    h_val = hybrid_metrics[metric] * 100
+    delta = h_val - v_val
+    pct_gain = (delta / (v_val + 1e-6)) * 100
+    comparison_rows.append({
+        'Metric': metric,
+        'Vanilla CNN (%)': f"{v_val:.2f}%",
+        'Hybrid TransUNet (%)': f"{h_val:.2f}%",
+        'Absolute Diff (Δ)': f"{'+' if delta >= 0 else ''}{delta:.2f}%",
+        'Relative Gain': f"{'+' if pct_gain >= 0 else ''}{pct_gain:.1f}%"
+    })
+
+# Add Latency and FPS
+comparison_rows.append({
+    'Metric': 'Latency (ms/slice)',
+    'Vanilla CNN (%)': f"{vanilla_metrics['Latency (ms/slice)']:.2f} ms",
+    'Hybrid TransUNet (%)': f"{hybrid_metrics['Latency (ms/slice)']:.2f} ms",
+    'Absolute Diff (Δ)': f"{hybrid_metrics['Latency (ms/slice)'] - vanilla_metrics['Latency (ms/slice)']:+.2f} ms",
+    'Relative Gain': "-"
+})
+comparison_rows.append({
+    'Metric': 'Inference FPS',
+    'Vanilla CNN (%)': f"{vanilla_metrics['Inference FPS']:.1f} FPS",
+    'Hybrid TransUNet (%)': f"{hybrid_metrics['Inference FPS']:.1f} FPS",
+    'Absolute Diff (Δ)': f"{hybrid_metrics['Inference FPS'] - vanilla_metrics['Inference FPS']:+.1f} FPS",
+    'Relative Gain': "-"
+})
+
+df_comp = pd.DataFrame(comparison_rows)
+print("\n" + "="*75)
+print("           ACCURACY & PERFORMANCE BENCHMARK COMPARISON")
+print("="*75)
+display(df_comp)
+
+
+# ==========================================================
+# 4. VISUAL COMPARISON PLOTS
+# ==========================================================
+# A. Bar Chart Comparison
+plt_metrics = ['Pixel Accuracy', 'Dice (F1-Score)', 'IoU (Jaccard)', 'Sensitivity (Recall)', 'Precision']
+vanilla_vals = [vanilla_metrics[m] * 100 for m in plt_metrics]
+hybrid_vals = [hybrid_metrics[m] * 100 for m in plt_metrics]
+
+x = np.arange(len(plt_metrics))
+width = 0.35
+
+plt.figure(figsize=(12, 6))
+bar1 = plt.bar(x - width/2, vanilla_vals, width, label='Vanilla CNN Baseline', color='#7f8c8d', alpha=0.9)
+bar2 = plt.bar(x + width/2, hybrid_vals, width, label='Hybrid TransUNet', color='#2980b9', alpha=0.9)
+
+# Add delta annotations on top of bars
+for i in range(len(plt_metrics)):
+    diff = hybrid_vals[i] - vanilla_vals[i]
+    sign = '+' if diff >= 0 else ''
+    plt.text(x[i] + width/2, hybrid_vals[i] + 1.2, f"{sign}{diff:.1f}%", ha='center', fontweight='bold', color='#1a5276', fontsize=10)
+
+plt.ylabel('Score (%)', fontsize=12)
+plt.title('Accuracy & Segmentation Metric Difference (Hybrid TransUNet vs Vanilla CNN)', fontsize=14, pad=15)
+plt.xticks(x, plt_metrics, fontsize=11)
+plt.ylim(0, 115)
+plt.legend(loc='upper right', fontsize=11)
+plt.grid(axis='y', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# B. Qualitative MRI Slice Comparison: [MRI | Ground Truth | Vanilla CNN | Hybrid TransUNet]
+model.eval()
+vanilla_model.eval()
+with torch.no_grad():
+    sample_imgs, sample_masks = next(iter(val_loader))
+    sample_imgs = sample_imgs.to(device)
+    
+    pred_hybrid = (torch.sigmoid(model(sample_imgs)) > 0.5).cpu().numpy()
+    pred_vanilla = (torch.sigmoid(vanilla_model(sample_imgs)) > 0.5).cpu().numpy()
+    orig_imgs = sample_imgs.cpu().numpy()
+    gt_masks = sample_masks.numpy()
+
+fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+cols = ['Input MRI', 'Ground Truth Mask', 'Vanilla CNN Output', 'Hybrid TransUNet Output']
+
+for j, col_name in enumerate(cols):
+    axes[0, j].set_title(col_name, fontsize=13, fontweight='bold', pad=10)
+
+for i in range(min(3, sample_imgs.size(0))):
+    # Denormalize Image for display
+    img_disp = np.transpose(orig_imgs[i], (1, 2, 0))
+    img_disp = (img_disp * np.array([0.229, 0.224, 0.225])) + np.array([0.485, 0.456, 0.406])
+    img_disp = np.clip(img_disp, 0, 1)
+
+    axes[i, 0].imshow(img_disp)
+    axes[i, 1].imshow(gt_masks[i, 0], cmap='gray')
+    axes[i, 2].imshow(pred_vanilla[i, 0], cmap='inferno')
+    axes[i, 3].imshow(pred_hybrid[i, 0], cmap='magma')
+
+    for ax in axes[i]:
+        ax.axis('off')
+
+plt.suptitle("Qualitative Segmentation Comparison on Validation Slices", fontsize=16, y=0.95)
+plt.tight_layout()
+plt.show()

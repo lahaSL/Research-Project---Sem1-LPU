@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+.env
+DATASET/
+Datasets/
+kaggle_3m/
+lgg-mri-segmentation/
+Testing only/
+.idea/
+.vscode/
